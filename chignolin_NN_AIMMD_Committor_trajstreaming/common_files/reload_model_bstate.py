@@ -2,8 +2,9 @@
 
 import torch
 import numpy
-import mdtraj
+import MDAnalysis as mda
 import itertools
+from MDAnalysis.analysis.distances import dist
 
 # neural network residual unit (credits: H. Jung)
 class _PreActivationResidualUnit(torch.nn.Module):
@@ -115,29 +116,34 @@ class Network(torch.nn.Module):
         self.resnet4.reset_parameters()
 
 
-def atom_select(trajectory):
+def atom_select(universe):
     """
     Sample featurization, Overwrite/monkey-patch.
     This is for chignolin, selecting heavy atoms that are not adjacent (resid > 3).
 
     """
-    atoms = trajectory.topology.select('protein')
-    heavy = trajectory.topology.select_atom_indices('heavy')
+    heavy = universe.select_atoms('protein and not name H*')
     pair_indices = numpy.array(
         [(i,j) for (i,j) in itertools.combinations(heavy, 2)
-            if abs(trajectory.topology.atom(i).residue.index - \
-                   trajectory.topology.atom(j).residue.index) > 3])
+            if abs(i.resid - j.resid) > 3])
+    ag1 = mda.core.groups.AtomGroup(pair_indices[:, 0])
+    ag2 = mda.core.groups.AtomGroup(pair_indices[:, 1])
+    # Return the two AtomGroups
+    return ag1, ag2
 
-    return pair_indices
-
-
-def featurize(input_file, topology=None, atom_select_func=None, dmin_file=None, dmax_file= None):
+def featurize(ag1, ag2, box=None, dmin_file=None, dmax_file= None):
     """
-    
+
     Parameters
     ----------
-    input_file: str
-        Path to input file for mdtraj to load.
+    ag1: AtomGroup
+        First MDAnalysis atom group
+
+    ag2: AtomGroup
+        Second MDAnalysis atom group
+
+    box: nump.array
+        Simulation box so that distances are calculated using periodic boundaries
 
     dmin_file: str
         Path to min distance numpy file for numpy to load.
@@ -149,33 +155,17 @@ def featurize(input_file, topology=None, atom_select_func=None, dmin_file=None, 
     -------
     distance matrix: numpy.ndarray
         Pairwise distance matrix.
-    
+
     """
-    # Load in trajectory
-    if topology:
-        trajectory = mdtraj.load(input_file, top=topology)
-    else:
-        trajectory = mdtraj.load(input_file)
-
-    # Select atoms
-    if atom_select_func:
-        pair_indices = atom_select_func(trajectory)
-    else:
-        # Calculate everything, pairwise. Huge!
-        *pair_indices, = itertools.combinations(range(trajectory.top.n_atoms), 2)
-        pair_indices = numpy.asarray(pair_indices)
-
-    
     # Min/Max normalization (if provided), then calculate pairwise dist.
     if dmin_file and dmax_file:
         dmin = numpy.load(dmin_file, allow_pickle=True)
         dmax = numpy.load(dmax_file, allow_pickle=True)
 
         # Return Normalized distance
-        return (mdtraj.compute_distances(trajectory, pair_indices) - dmin[None, :]) / (dmax - dmin)[None, :]
+        return  ((dist(ag1, ag2, box=box)[2, :])/10 - dmin[None, :]) / (dmax - dmin)[None, :]
     else:
-        mdtraj.compute_distances(trajectory, pair_indices) 
-
+        return (dist(ag1, ag2, box=box)/10)[2, :]
 
 if __name__ == '__main__':
     model = Network() # Create model
@@ -186,9 +176,12 @@ if __name__ == '__main__':
     model.load_state_dict(state_dict) # Load in parameters
     model.eval() # Turn training mode off
 
+    # Create universe
+    u = mda.Universe('seg.gro')
+    ag1, ag2 = atom_select(u)
     # Compute descriptors
-    descriptors = featurize('seg.gro', topology=None, atom_select_func=atom_select, dmin_file='dmin.npy', dmax_file='dmax.npy')
-
+    # Need to convert to float32 for compatibility with the model
+    descriptors = numpy.float32(featurize(ag1, ag2, box=u.trajectory[0].dimensions, dmin_file='dmin.npy', dmax_file='dmax.npy'))
     # Input descriptors into NN
     with torch.no_grad():
         output = model(torch.as_tensor(descriptors))
